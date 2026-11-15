@@ -39,6 +39,29 @@ Consequences:
 - `dup2(fd, 1)` is how the shell redirects stdout: fd 1 now points to the file's OFD.
 - fd 0, 1, 2 = stdin, stdout, stderr. `open()` returns the **lowest free** fd number.
 
+> **"Parent and child share one offset, but run in parallel on different cores. How can that work?"**
+> `fork` **copies the fd table** but **shares the OFD**. The offset lives in the OFD, which is **one object in kernel memory**, reachable from every core (RAM is shared). Two cores *can* hit it at once, so it's an ordinary race, and the kernel solves it with a lock.
+>
+> | Item | After `fork` | Consequence |
+> |---|---|---|
+> | fd table | **copied** | child's `close(3)` doesn't close the parent's fd 3 |
+> | OFD (offset, flags) | **shared** | same offset; `fcntl(F_SETFL, O_NONBLOCK)` in one affects the other |
+> | inode, page cache | shared | same file data |
+>
+> Linux's OFD (`struct file`) has a mutex, **`f_pos_lock`**. Each `read`/`write` on a regular file does: *lock → pos = offset → transfer [pos, pos+n) → offset = pos + n → unlock*.
+> ```
+> Core 0: parent write(3,"AAAA",4)      Core 1: child write(3,"BBBB",4)
+>   lock ✓, pos = 0 → bytes [0,4)          lock → BLOCKED
+>   offset = 4, unlock  ─────────────►     lock ✓, pos = 4 → bytes [4,8), offset = 8, unlock
+> File = "AAAABBBB" or "BBBBAAAA". Never "ABAB", never an overwrite.
+> ```
+> - Interleaving happens per **whole `write()` call**. The order isn't defined; *no overlap* is guaranteed. POSIX requires this for regular files; Linux has done it correctly since 3.14.
+> - Shared-fd `read()`s **split the data**: each chunk goes to only one of parent/child.
+> - The lock is taken only when the OFD is shared (refcount > 1).
+> - **Two separate `open()`s = two OFDs, two offsets ⇒ both write at 0 ⇒ the last writer wins.** Fix: `O_APPEND` (each write moves to EOF atomically under the inode lock).
+> - **`pread`/`pwrite`** take an explicit offset and never touch the shared one, so there's no offset contention between threads (databases use them).
+> - Trap: **stdio buffers are user memory, duplicated by `fork`.** `printf("hi")` (no `\n`) then `fork` ⇒ "hi" is printed twice. stdio flushes in buffer-sized chunks, so lines can interleave mid-line.
+
 ### 2.2 Inode and directories
 **Inode (index node)** contains: file type, permissions (rwx for user/group/other), owner UID/GID, size, timestamps (atime, mtime, ctime), **link count**, and **pointers to data blocks**. It does **not** contain the file name.
 **Directory** = a special file containing entries (name → inode number). `.` = itself, `..` = parent.
@@ -51,7 +74,75 @@ root inode (#2, well-known) → read root dir blocks → find "home" → inode #
 ```
 Each step may need a disk read, so the kernel caches lookups in the **dentry cache** and **inode cache**.
 
+> **"Is a directory also an inode? Is N1 the inode of `home`?"** Yes and yes.
+> A directory is a file with its **own inode**, whose *type* field = directory. Its block pointers lead to blocks of **directory entries** (name → inode #), not to file bytes. **No inode stores its own name.** "home" is written inside **root's** data block as `"home" → N1`, which is why hard links work.
+> ```
+> inode 2 (DIR) "/"          → block 1000: "." → 2, ".." → 2, "home" → 131073 (N1), "etc" → 262145
+> inode 131073 (DIR) /home   → block 5200: "." → 131073, ".." → 2, "ram" → 131200 (N2)
+> inode 131200 (DIR) ram     → block 6100: "." → 131200, ".." → 131073, "a.txt" → 131305 (N3)
+> inode 131305 (REGULAR, 3000 B) → block 7000: the file's bytes
+> ```
+> Per step: (1) read the **inode** (permissions + where its blocks are); (2) read the directory's **data block** and search it for the next name.
+>
+> **Inode number → disk location is arithmetic, not a search.** Inodes sit in a fixed on-disk **inode table**; ext4 splits it across *block groups*: group = (ino − 1) / inodes_per_group, index = (ino − 1) % inodes_per_group, byte offset = index × inode size. E.g. ino 131073, 8192 per group ⇒ group 16, slot 0.
+> **Why root = #2:** 0 means "no inode" (empty entry); ext2/3/4 reserve 1 (historically the bad-blocks list). So the root is a fixed well-known number (`ls -id /` ⇒ `2 /`).
+> **Directory link count** = 2 + number of subdirectories (its name in the parent, its own ".", and each child's "..").
+>
+> | Bit | File | Directory |
+> |---|---|---|
+> | r | read contents | **list** names |
+> | w | modify contents | **create / delete / rename entries** |
+> | x | execute | **traverse** (use it in a path) |
+>
+> Resolving `/home/ram/a.txt` needs **x** on `/`, `/home`, `/home/ram`. **Deleting a file needs w on its directory**, not on the file: unlink only edits the directory's data.
+
 ### 2.3 Hard links vs symbolic (soft) links
+> Builds on §2.2: a directory is a list of (name → inode number). A **link** = a way to reach a file by a name. **Hard link** = *another name* for the same inode. **Soft (symbolic) link** = *a small separate file that contains a path* to another name.
+
+#### 2.3.1 Hard link = just another directory entry
+**Every ordinary file name is already a hard link.** Creating `a.txt` makes inode 131305 and adds the entry `"a.txt" → 131305` to the directory ⇒ link count = 1. `ln a.txt b.txt` adds **one more entry with the same inode number**. Nothing is copied.
+```
+$ echo hello > a.txt
+$ ln a.txt b.txt
+$ ls -li
+131305 -rw-r--r-- 2 ram ram 6  a.txt     ← same inode number
+131305 -rw-r--r-- 2 ram ram 6  b.txt     ← link count 2
+
+directory /home/ram (data block)            inode 131305 (REGULAR, links = 2)
+   "a.txt" → 131305 ──┐                      ──► block 7000: "hello\n"
+   "b.txt" → 131305 ──┘
+```
+- The names are **equal**: there's no "original" and no "link". Writing via `b.txt` changes what `a.txt` shows (one inode, one set of data blocks and permissions).
+- `rm a.txt` removes only that **entry**; the link count goes 2 → 1 and `cat b.txt` still prints `hello`. Data is freed only at link count 0 **and** no open fds.
+
+#### 2.3.2 Soft (symbolic) link = a small file holding a path
+`ln -s a.txt c.txt` creates a **new inode of type symlink** whose content is the text `a.txt`.
+```
+$ ln -s a.txt c.txt
+$ ls -li c.txt
+131400 lrwxrwxrwx 1 ram ram 5  c.txt -> a.txt    ← own inode, type 'l', size 5 = strlen("a.txt")
+
+"c.txt" → 131400 (SYMLINK, content "a.txt") ··· by NAME ···► whatever "a.txt" currently is
+```
+When path resolution reaches a symlink inode, it **reads the stored path and continues the walk with it** (a relative path is taken from the symlink's own directory). So a symlink points to a **name**, not an inode. `stat` follows it; `lstat` describes the link itself; `open(..., O_NOFOLLOW)` refuses to follow it.
+
+#### 2.3.3 One experiment shows every difference
+```
+start:   a.txt ─► inode 131305 "hello";  b.txt = hard link;  c.txt -> "a.txt"
+
+$ rm a.txt
+   b.txt → inode 131305, still "hello"          (links 2 → 1)
+   c.txt → name "a.txt" not found → ENOENT      (DANGLING)
+
+$ echo bye > a.txt       # NEW file, new inode 131500
+   b.txt → still "hello"   (tied to inode 131305)
+   c.txt → "bye"           (follows whatever is NAMED a.txt now)
+```
+**Why the restrictions in the table below exist:**
+- **No hard links across file systems:** an entry stores only an inode **number**, and #131305 on disk A means nothing on disk B.
+- **No hard links to directories:** they could create cycles (`find`/`du` loop forever, and `..` becomes ambiguous). Symlink cycles are possible but bounded: the kernel follows at most 40 per path (`ELOOP`), and `find` doesn't follow symlinks by default.
+
+#### 2.3.4 Comparison table
 | | Hard link (`ln a b`) | Symbolic link (`ln -s a b`) |
 |---|---|---|
 | What it is | another directory entry pointing to the **same inode** | a small file whose content is a **path** |
@@ -61,6 +152,13 @@ Each step may need a disk read, so the kernel caches lookups in the **dentry cac
 | To directories | ❌ (would create cycles) | ✅ |
 | Own inode? | no (shares one) | yes |
 **Deleting a file = `unlink()`** removes one name and decrements the link count. Blocks are freed only when the **link count = 0 AND no process has it open**. That's why disk space isn't freed when you delete a huge log a process still writes to (`lsof | grep deleted`), and why "unlink a temp file right after opening it" is a trick for auto-cleanup.
+
+**Where each is used:**
+| Hard links | Soft links |
+|---|---|
+| `mv` within one FS = link the new name + unlink the old ⇒ **instant, no data copied** (across file systems `mv` must copy) | shared-library versions: `libfoo.so → libfoo.so.1 → libfoo.so.1.2.3` |
+| backup snapshots (`rsync --link-dest`): unchanged files are shared, not copied | `/usr/bin/python → python3.12`; release switching (`current → release-42`) |
+| | pointing into another file system or disk |
 
 ### 2.4 Allocation methods: where a file's blocks live
 | Method | How | Pros | Cons |
@@ -156,11 +254,15 @@ write(fd, buf, n):
 
 ### Basic
 - **Q: What is an inode? Does it store the file name?** File metadata + block pointers. No name: names live in directory entries.
-- **Q: Hard link vs soft link?** §2.3 table.
+- **Q: Hard link vs soft link?** Hard link = another directory entry with the same inode number (every filename is one; the names are equal; data survives until link count 0). Soft link = its own inode containing a path, followed by name at lookup time (dangles if the name disappears; works across file systems and to directories). The §2.3.3 experiment shows it all. *Follow-up:* "You `rm` the target and recreate a file with the same name. What do the hard link and the symlink show?" Hard link: the old contents (old inode). Symlink: the new file.
+- **Q: Why is `mv` of a 50 GB file instant within a disk but slow to another disk?** Within one FS it only adds a new directory entry and removes the old one (same inode, no data moved). Across file systems inode numbers don't carry over, so it must copy the data and then delete the original.
+- **Q: Is a directory an inode? Where is a directory's name stored?** Yes: an inode of type directory whose data blocks hold (name → inode #) entries. Its name is stored in its **parent's** entries, not in its own inode. *Follow-up:* "Can you delete a read-only file you don't own?" Yes, if you have w + x on the directory (unless the directory has the sticky bit, like `/tmp`), because deletion edits the directory, not the file.
 - **Q: What is a file descriptor?** A per-process integer index into the fd table, pointing to an open-file description (offset, flags) → inode.
 
 ### Intermediate
 - **Q: After fork, parent and child write to the same fd. What happens to the offset?** Shared (same OFD) ⇒ writes interleave, no overwrite.
+  *Follow-up:* "They run in parallel on two cores. How is the shared offset safe?" The OFD is one kernel object protected by `f_pos_lock`. Each write reserves [pos, pos+n) and advances the offset under the lock ⇒ whole writes interleave in some order, never overlap (POSIX; Linux ≥ 3.14). Separate `open()`s don't share an offset ⇒ they overwrite unless `O_APPEND`. Threads that want no shared-offset contention use `pwrite`.
+- **Q: Why does `printf("hi"); fork();` print "hi" twice?** The stdio buffer is in user memory, which the child gets a copy of; both processes flush it at exit. Fix: `fflush(stdout)` before `fork`.
 - **Q: I deleted a 50 GB log file but `df` shows no free space. Why?** A process still has it open; blocks are freed only when the link count = 0 and there are no open fds. Restart the process, or truncate via `/proc/<pid>/fd/N`.
 - **Q: What is journaling? ext4 ordered mode?** §2.6.
 - **Q: Contiguous vs linked vs indexed allocation?** §2.4.
@@ -180,6 +282,8 @@ write(fd, buf, n):
 - Thinking `close()` or `write()` guarantee the data is on disk.
 - Forgetting the directory `fsync` after `rename` for durability.
 - Mixing up fork-shared offsets (same OFD) with re-`open` (independent offsets).
+- Thinking the parallel parent/child writes corrupt the offset. The kernel serialises them with the OFD's `f_pos_lock`; only the *order* is undefined.
+- Thinking `fork` shares the fd **table**. The table is copied (closing in one doesn't close in the other); only the OFDs behind it are shared.
 - Forgetting the indirect-block reads when counting disk accesses.
 
 ---
@@ -189,9 +293,11 @@ write(fd, buf, n):
 |---|---|
 | Three tables | fd table (per process) → open-file description (offset, flags) → inode |
 | fork/dup | share the OFD ⇒ share the offset |
+| Parallel writes, shared fd | fd table copied, OFD shared; `f_pos_lock` ⇒ each write reserves [pos, pos+n) atomically ⇒ interleave, no overwrite. Separate opens ⇒ overwrite unless O_APPEND; `pwrite` avoids the shared offset |
 | Inode | metadata + block pointers; link count; **no name** |
 | Directory | name → inode number |
-| Hard vs soft | same inode, same FS, no dirs / path file, can dangle |
+| Directory = inode | type DIR; data blocks = entries; name lives in the **parent**; link count = 2 + subdirs; r = list, w = add/remove entries, x = traverse; root = #2 |
+| Hard vs soft | hard = extra entry → same inode (every name is one; same FS, no dirs) / soft = own inode holding a path, followed by name (can dangle; recreate target ⇒ points to new file) |
 | unlink | freed when link count 0 **and** not open |
 | Allocation | contiguous, linked, FAT, indexed (12 direct + 1/2/3 indirect), extents |
 | Max size (4 KB, 4 B ptrs) | 48 KB + 4 MB + 4 GB + 4 TB |

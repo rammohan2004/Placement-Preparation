@@ -1,6 +1,6 @@
 # 11. I/O Systems, I/O Models & Disk Scheduling
 
-> **Asked at:** [HFT] blocking vs non-blocking vs epoll vs busy polling, kernel bypass, zero-copy · [AMZN] [DESHAW] select/poll/epoll, C10K, disk scheduling numericals · [NVIDIA] [QCOM] device drivers, interrupt top/bottom halves, DMA, ioctl/mmap · [TI] polling vs interrupts in firmware.
+> **Asked at:** [HFT] blocking vs non-blocking vs epoll vs busy polling, kernel bypass, zero-copy · [AMZN] [DESHAW] select/poll/epoll, C10K, disk scheduling numericals, RAID levels · [NVIDIA] [QCOM] device drivers, interrupt top/bottom halves, DMA, ioctl/mmap · [TI] polling vs interrupts in firmware.
 > **Prerequisites:** [01 OS Basics](01-OS-Basics-Kernel-and-System-Calls.md), [COA 13 I/O, Interrupts & DMA](../Computer%20Organization%20and%20Architecture/13-IO-Interrupts-DMA.md) (MMIO, interrupt hardware, DMA engines).
 
 ---
@@ -128,7 +128,47 @@ The kernel network stack costs ~5–20 µs per packet round trip (interrupt, sof
 | **LOOK / C-LOOK** | like SCAN / C-SCAN but turn at the **last request**, not the disk end | what's actually used in practice |
 **SSDs:** no seek ⇒ these algorithms don't matter. Linux uses `none` or `mq-deadline` for NVMe (multi-queue block layer, many hardware queues). SSD details that come up: the FTL (flash translation layer), erase-before-write in large blocks, **write amplification**, TRIM, wear levelling. NVMe SSD: ~50–100 µs random read, hundreds of thousands of IOPS with deep queues.
 
-**RAID (one line each):** 0 = striping (speed, no redundancy) · 1 = mirroring · 5 = striping + distributed parity (survives 1 disk failure) · 6 = two parities (2 disks) · 10 = mirror + stripe.
+### 2.11 RAID: many disks that look like one [AMZN][DESHAW]
+**Problem:** one disk is **slow** (HDD ~200 MB/s, ~100–150 random IOPS) and **fails** (~1–2 % per year, taking its data with it).
+**RAID (Redundant Array of Independent Disks):** put N disks behind a layer that shows the OS **one logical disk** (e.g. `/dev/md0`). The layer decides which physical disk each block goes to, which makes the logical disk faster, bigger, fault-tolerant, or a mix. The layer is either a **hardware RAID controller** or **software** (Linux `md`/`mdadm`, ZFS, Windows Storage Spaces). The file system above doesn't know.
+
+**The three building blocks:**
+- **Striping:** cut data into fixed chunks (e.g. 64 KB) and spread them round-robin across disks ⇒ one large I/O uses all disks in parallel.
+  ```
+  logical: A0 A1 A2 A3 A4 A5 …     Disk1: A0 A3   Disk2: A1 A4   Disk3: A2 A5    (~3× throughput)
+  ```
+- **Mirroring:** write identical copies to 2+ disks. Survives a disk loss; costs half the space.
+- **Parity:** store the **XOR** of the data chunks in one extra chunk. Since x ⊕ x = 0, any **one** lost chunk = XOR of all the others.
+  ```
+  D0 = 1011, D1 = 0110, D2 = 1100  ⇒  P = D0 ⊕ D1 ⊕ D2 = 0001
+  disk with D1 dies:  D1 = D0 ⊕ D2 ⊕ P = 1011 ⊕ 1100 ⊕ 0001 = 0110 ✓
+  ```
+  Protection for the price of **one** disk's space (vs half for mirroring).
+
+**The levels = combinations of these:**
+```
+RAID 0 (stripe)     RAID 1 (mirror)    RAID 5 (stripe + rotating parity)    RAID 10 (mirror pairs, striped)
+D1  D2  D3          D1  D2             D1  D2  D3  D4                       [D1 D2]   [D3 D4]
+A0  A1  A2          A0  A0             A0  A1  A2  Pa                       A0 A0     A1 A1
+A3  A4  A5          A1  A1             B0  B1  Pb  B2                       A2 A2     A3 A3
+                                       C0  Pc  C1  C2     ← parity on a different disk each row
+```
+N disks of capacity C each:
+| Level | Usable space | Survives | Reads | Small random write costs | Typical use |
+|---|---|---|---|---|---|
+| **0** striping | N·C | **0 failures**: one disk dies ⇒ all data lost | ~N× | 1 I/O | scratch, caches |
+| **1** mirroring (usually 2 disks) | **C**: every disk holds the *same full copy*, so 2 disks ⇒ C and a 3-way mirror ⇒ still C | N − 1 (2 disks ⇒ 1) | up to N× | N I/Os (2 for a pair) | boot/OS disk |
+| **5** stripe + 1 distributed parity (≥ 3 disks) | (N−1)·C | 1 | fast | **4 I/Os** | read-mostly storage |
+| **6** stripe + 2 parities (≥ 4) | (N−2)·C | **any 2** | fast | **6 I/Os** | large-disk arrays |
+| **10** mirror + stripe (≥ 4) | N·C / 2 | 1 per mirror pair | fast | 2 I/Os | **databases** |
+
+- **RAID 1 vs RAID 10 space:** adding disks to RAID 1 adds **copies** (usable stays C, survives N − 1). Adding disks to RAID 10 adds **pairs** (usable = (N/2)·C, survives 1 per pair). So (N/2)·C is the RAID 10 formula, and both give C at N = 2.
+- **Why "distributed" parity (RAID 5 vs RAID 4):** every write updates parity. One dedicated parity disk (RAID 4) would be hit by *every* write and become the bottleneck; rotating it spreads the load.
+- **Small-write penalty (RAID 5):** to change one chunk, `new P = old P ⊕ old D ⊕ new D` ⇒ read old D, read old P, write new D, write new P = **4 I/Os per logical write** (RAID 6: 6). Hence databases prefer RAID 10.
+- **Rebuild window:** after one failure, RAID 5 has **no** protection until the new disk is rebuilt by reading *every* other disk in full (4 TB ÷ ~150 MB/s ≈ 7.4 h). A second failure or unreadable sector then loses data ⇒ big arrays use RAID 6.
+- **RAID is not a backup:** it protects against a disk dying, not against `rm`, bugs, corruption or ransomware (those reach every copy instantly).
+- **Cloud [AMZN]:** generalised parity = **erasure coding** (Reed–Solomon, e.g. 10 data + 4 code chunks, any 4 can be lost) ⇒ object stores get high durability at ~1.4× space instead of 3× replication.
+- SSD arrays use the same levels; only the "seek" part of the performance story disappears.
 
 ---
 
@@ -153,6 +193,16 @@ Total = 146 + 37 = **183** if the return jump isn't counted, **382** if it is (1
 Rotational = 0.5 × 60/7200 s = 4.17 ms. Transfer = 4 KB / 200 MB/s ≈ 0.02 ms. Total ≈ **9.2 ms** ⇒ ≈ **109 random IOPS**. An NVMe SSD at ~80 µs ⇒ ~12,500 IOPS per queue at depth 1, ≈ 100× better.
 
 **N7. Interrupts vs polling at high packet rates.** 1 M packets/s; interrupt cost 2 µs per packet ⇒ 2 s of CPU per second ⇒ **impossible on one core** (interrupt storm, livelock). NAPI/polling with batches of 64 ⇒ 15,625 interrupts/s ⇒ ~31 ms ⇒ 3 %. Busy polling: one core at 100 %, but the lowest latency.
+
+**N8. RAID capacity, write IOPS and reliability.** 6 HDDs, each 4 TB, 150 random IOPS, failure rate 2 %/year.
+| Level | Usable | Random reads/s | Random small writes/s |
+|---|---|---|---|
+| RAID 0 | 6 × 4 = **24 TB** | 6 × 150 = 900 | 900 / 1 = **900** |
+| RAID 10 | 24 / 2 = **12 TB** | 900 | 900 / 2 = **450** |
+| RAID 5 | 5 × 4 = **20 TB** | ≈ 900 | 900 / 4 = **225** |
+| RAID 6 | 4 × 4 = **16 TB** | ≈ 900 | 900 / 6 = **150** |
+(Writes: total disk I/Os per second ÷ I/Os each logical write costs.)
+Reliability of RAID 0 with 4 disks: P(no disk fails in a year) = 0.98⁴ = 0.922 ⇒ **P(lose everything) ≈ 7.8 %/year**, about 4× a single disk. Striping alone *reduces* reliability.
 
 **Try it:** head at 50, cylinders 0–199, queue 82, 170, 43, 140, 24, 16, 190. Total movement for SSTF and for SCAN moving toward 199.
 <details><summary>Answer</summary>SSTF: 50→43 (7) →24 (19) →16 (8) →82 (66) →140 (58) →170 (30) →190 (20) = <b>208</b>. SCAN up: 50→82→140→170→190→199 = 149, then 199→43 (156) →24 (19) →16 (8) ⇒ 149 + 156 + 19 + 8 = <b>332</b> (= 149 + 183).</details>
@@ -179,6 +229,10 @@ Rotational = 0.5 × 60/7200 s = 4.17 ms. Transfer = 4 KB / 200 MB/s ≈ 0.02 ms.
 - **Q: epoll vs io_uring?** Readiness vs completion; io_uring batches many operations per syscall (or none with SQPOLL) and supports regular files properly (epoll doesn't help with disk files: they're always "ready").
 - **Q [NVIDIA][QCOM]: How does a user-space program talk to a GPU/accelerator?** Through the driver's device file: `ioctl` for control, `mmap` of command buffers/device memory, DMA for bulk data, interrupts or fences for completion.
 - **Q: Why can't you do heavy work in an interrupt handler?** Interrupts may be disabled (other devices delayed), you can't sleep, and it adds latency to everything ⇒ defer to softirq/workqueue/threaded IRQ.
+- **Q: What is RAID? Compare 0, 1, 5, 6 and 10.** Many disks shown as one logical disk, built from striping (speed), mirroring (copies) and parity (XOR rebuilds one lost chunk). See the §2.11 table: 0 = fast, no protection; 1 = mirror; 5 = (N−1) space, survives 1; 6 = survives 2; 10 = mirror + stripe, half space, best for writes. *Follow-up:* "How does RAID 5 rebuild a dead disk?" XOR the surviving chunks of each stripe (D_lost = XOR of the others, including parity).
+- **Q: Why do databases prefer RAID 10 over RAID 5?** The RAID-5 small-write penalty: one logical write = read old data + read old parity + write both = 4 I/Os (RAID 10: 2). Also rebuilds are faster and less risky (copy one mirror instead of reading every disk).
+- **Q: Is RAID a backup?** No. It survives disk failure only; deletes, corruption and ransomware hit all copies immediately.
+- **Q [AMZN]: How do cloud object stores get durability cheaper than 3 copies?** Erasure coding (generalised parity, e.g. 10 + 4 Reed–Solomon chunks across machines/racks): survives 4 losses at 1.4× space.
 - **Q: Do disk-scheduling algorithms matter for NVMe?** Barely: no seek time; deep parallel hardware queues; Linux uses `none`/`mq-deadline`.
 
 ---
@@ -190,6 +244,9 @@ Rotational = 0.5 × 60/7200 s = 4.17 ms. Transfer = 4 KB / 200 MB/s ≈ 0.02 ms.
 - Counting (or not counting) the C-SCAN return jump without stating it.
 - Doing heavy processing in a top-half ISR.
 - Assuming interrupts are always better than polling (not at very high rates or for lowest latency).
+- Calling RAID 0 "redundant". It has no redundancy, and with N disks it fails ~N× more often than one disk.
+- Forgetting the RAID-5 write penalty (4 I/Os per small write) when estimating write IOPS.
+- Saying "RAID means we don't need backups."
 
 ---
 
@@ -209,3 +266,5 @@ Rotational = 0.5 × 60/7200 s = 4.17 ms. Transfer = 4 KB / 200 MB/s ≈ 0.02 ms.
 | HDD time | seek + ½ rotation + transfer ≈ 10 ms ⇒ ~100 IOPS |
 | Disk scheduling | FCFS 640, SSTF 236, SCAN 236 (classic queue, head 53) |
 | SSD | no seek; FTL, write amplification, TRIM; `none`/`mq-deadline` |
+| RAID building blocks | striping (parallel speed) · mirroring (copies) · parity (XOR rebuilds 1 lost chunk) |
+| RAID levels | 0: N·C, survives 0 · 1: C (N copies), survives N−1 · 5: (N−1)C, survives 1, write = 4 I/Os · 6: (N−2)C, survives 2, 6 I/Os · 10: N·C/2, DBs · not a backup · cloud = erasure coding |

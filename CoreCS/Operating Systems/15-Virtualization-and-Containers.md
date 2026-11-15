@@ -5,9 +5,80 @@
 
 ---
 
-## 1. Intuition
-- A **virtual machine** is a **separate house built inside a big building**: it has its own kitchen, plumbing and front door (its own OS kernel). The building manager (the **hypervisor**) splits the real utilities between houses. Strong isolation, but each house carries a full kernel.
-- A **container** is a **separate apartment in one house**: its own room, lock and name on the door, but everyone shares the house's plumbing (the **host kernel**). Lightweight and fast to start, but weaker walls.
+## 1. Intuition (read this first)
+
+### 1.1 The problem both solve
+One physical server (e.g. 64 cores, 256 GB) must run apps from many teams or customers. Run them as plain processes and:
+- they **see each other**: they can list, read or kill each other's processes and files;
+- they **conflict**: both want port 80, or one needs Python 3.8 and another 3.12;
+- one app can **eat all the CPU/RAM** (noisy neighbour);
+- one may need a **different OS** (Windows);
+- in the cloud, customers **don't trust each other**.
+
+**Goal:** give each app the *illusion of its own machine*. Two ways:
+- **VM:** fake the **hardware**, and run a whole OS on it.
+- **Container:** fake the **OS's view**, and run only processes.
+
+Terms used below:
+- **Hypervisor:** software that creates and runs VMs, splitting the real hardware among them (§2.1).
+- **Host:** the real machine and its OS. **Guest:** the OS inside a VM.
+
+### 1.2 The layer picture
+```
+          VIRTUAL MACHINES                                 CONTAINERS
+ ┌──────────┐ ┌──────────┐ ┌──────────┐        ┌────────┐ ┌────────┐ ┌────────┐
+ │  App A   │ │  App B   │ │  App C   │        │ App A  │ │ App B  │ │ App C  │
+ │  libs    │ │  libs    │ │  libs    │        │ libs   │ │ libs   │ │ libs   │
+ │ GUEST    │ │ GUEST    │ │ GUEST    │        └───┬────┘ └───┬────┘ └───┬────┘
+ │ KERNEL   │ │ KERNEL   │ │ KERNEL   │            │  namespaces + cgroups │
+ │ (Linux)  │ │ (Linux)  │ │(Windows) │        ┌───┴──────────┴──────────┴───┐
+ └────┬─────┘ └────┬─────┘ └────┬─────┘        │   ONE HOST KERNEL (Linux)   │
+ ┌────┴────────────┴────────────┴─────┐        └──────────────┬──────────────┘
+ │ HYPERVISOR (fakes the hardware)    │                       │
+ └─────────────────┬──────────────────┘                       │
+             real hardware                              real hardware
+```
+- **VM:**
+  - The hypervisor gives each VM **virtual hardware**: virtual CPUs, "physical" RAM, a virtual disk and NIC.
+  - Each VM **boots its own complete kernel** (the guest kernel), which believes it owns a real computer.
+- **Container:**
+  - **No fake hardware, no second kernel.** The apps are **ordinary processes on the one host kernel**.
+  - The kernel shows each group a restricted view: **namespaces** = *what it can see* (own process list, filesystem, network/ports, hostname).
+  - It also enforces limits: **cgroups** = *what it can use* (e.g. ≤ 2 CPUs, ≤ 4 GB). Details in §2.5.
+
+### 1.3 Follow one `read()` call
+```
+Container:  app → syscall → HOST kernel → disk driver → disk            (same as any process: ~no overhead)
+VM:         app → syscall → GUEST kernel → guest's virtual-disk driver
+                → VM exit to the hypervisor → host's real driver → disk → back up the same way
+```
+Ordinary instructions in a VM run directly on the real CPU (hardware support, §2.2). Overhead appears only on I/O, privileged instructions and TLB misses (§2.3).
+
+### 1.4 What each looks like from the host
+- **Container:** the host's `ps` lists the container's processes. nginx is PID 1 *inside* but PID 48213 on the host, so **it's just a process with a different view**.
+- **VM:** the host's `ps` shows **one** process (`qemu-kvm`; its threads are the virtual CPUs). The guest's processes are **invisible to the host kernel**: they exist only in the guest kernel's tables.
+
+### 1.5 Why the isolation differs
+| | VM | Container |
+|---|---|---|
+| Kernel bug or crash | affects only that VM | shared kernel ⇒ **all containers + host** affected |
+| To break out you must… | break the hypervisor (small interface, hardware-enforced) | exploit any of ~400 host-kernel syscalls |
+| Different OS? | yes (Windows VM on a Linux host) | no (a Linux container needs a Linux kernel) |
+| Start-up | boot an OS: seconds | start a process: milliseconds |
+| Memory per instance | own kernel + OS services: 100s of MB to GBs | just the app |
+
+### 1.6 Analogy, mapped piece by piece
+| Analogy | Real thing |
+|---|---|
+| a big building | the physical server |
+| a separate **house** with its own kitchen and plumbing | a VM with its **own kernel** |
+| the building manager splitting water/electricity | the hypervisor splitting CPU, RAM, devices |
+| **apartments** sharing one house's plumbing | containers sharing **one host kernel** |
+| your own room, lock and name on the door | namespaces (own view of processes, files, network, hostname) |
+| a water/electricity quota per apartment | cgroups (CPU/memory limits) |
+| a burst pipe floods every apartment | a kernel bug/panic hits every container |
+
+**One line:** a VM fakes the hardware and runs a whole OS; a container fakes the OS's view and runs only processes.
 
 ---
 
@@ -114,6 +185,7 @@ Native TLB miss = 4 memory references. Nested = (4 + 1)(4 + 1) − 1 = **24**. A
 - **Q: VM vs container?** §2.6 table: own kernel vs shared kernel.
 - **Q: Type 1 vs Type 2 hypervisor?** §2.1.
 - **Q: What are namespaces and cgroups?** Namespaces limit what you can see; cgroups limit what you can use.
+- **Q: From the host, what do you see of a running container vs a running VM?** Container: its processes appear in the host's `ps` (different PIDs than inside), because they're host processes. VM: one `qemu-kvm` process whose threads are vCPUs; the guest's processes are invisible, existing only in the guest kernel. *Follow-up:* "Why is a container's syscall cheaper than a VM's I/O?" The container's goes straight to the host kernel; the VM's goes to the guest kernel, then a VM exit to the hypervisor, then the real driver (§1.3).
 
 ### Intermediate
 - **Q: How does hardware-assisted virtualization work?** VT-x/AMD-V root/non-root modes, VM exits on sensitive operations, VM entry back.
@@ -143,6 +215,7 @@ Native TLB miss = 4 memory references. Nested = (4 + 1)(4 + 1) − 1 = **24**. A
 ## 6. Revision Summary
 | Topic | Remember |
 |---|---|
+| VM vs container (one line) | VM = fake hardware + own guest kernel (host sees one qemu process) · container = host processes with a restricted view (namespaces) + limits (cgroups) |
 | Hypervisors | Type 1 bare metal (ESXi, Xen, KVM, Hyper-V, Nitro) vs Type 2 hosted (VirtualBox) |
 | CPU virt | trap-and-emulate (Popek–Goldberg), binary translation, paravirt (hypercalls), VT-x/AMD-V (VM exit ~1 µs) |
 | Memory virt | shadow tables → EPT/NPT; 2-D walk 24 refs; huge pages |
